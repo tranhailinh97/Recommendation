@@ -1,122 +1,28 @@
-from flask import Flask, request, jsonify, render_template
+from flask import Flask, request, jsonify, make_response, render_template
 import pandas as pd
-from surprise import dump, Reader, Dataset, SVD
-from flask import make_response
+from surprise import SVD, dump
+from surprise import Dataset, Reader
+from surprise.model_selection import train_test_split
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import linear_kernel
 import numpy as np
-from surprise.model_selection import train_test_split
 
-# load cleaned dataset
-song_df = pd.read_csv("Data/cleaned_song_dataset.csv")
+# Load cleaned dataset
+song_df = pd.read_csv("clean_song_dataset_0_log.csv")
 
 # Create a temporary user id for new users
 temp_user_id = 'temp_user'
 
-# Collaborative Filtering Model
-reader = Reader(rating_scale=(0, song_df['play_count'].max()))
-data = Dataset.load_from_df(song_df[['user', 'title', 'play_count']], reader)
-trainset, testset = train_test_split(data, test_size=0.2, random_state=42)
-collab_model = SVD()
-collab_model.fit(trainset)
+# Collaborative Filtering Model - Load the model
+collab_model = dump.load("model/collab_model.pkl")[1]
 
 # Content-Based Model (using TF-IDF on song titles)
 tfidf_vectorizer = TfidfVectorizer(stop_words='english')
-tfidf_matrix = tfidf_vectorizer.fit_transform(song_df['title'])
-content_model = linear_kernel(tfidf_matrix, tfidf_matrix)
+tfidf_matrix = tfidf_vectorizer.fit_transform(song_df[['title', "artist_name", 'release']])
 
-# Load the model
-# collab_model = dump.load("model/collab_model.pkl")[1]
 
 # Flask app
 app = Flask(__name__)
-
-@app.route("/")
-def index():
-    return render_template("index.html")
-
-
-# API endpoint for recommendations
-# @app.route('/recommendations', methods=['GET'])
-# def get_recommendations():
-#     user_id = str(request.args.get('user_id'))
-#
-#     if user_id is None:
-#         return jsonify({"error": "Missing 'user_id' parameter"}), 400
-#
-#     listened_songs, recommendations = collaborative_filtering_recommendation(user_id, collab_model, song_df)
-#
-#     return make_response(jsonify({
-#         'user_songs': listened_songs,
-#         'recommendations': recommendations
-#     }))
-#
-#
-# def collaborative_filtering_recommendation(selected_songs, model, df):
-#     listened_songs = df[df['song'].isin(selected_songs)]['title'].tolist()
-#
-#     all_songs = df['title'].unique()
-#     unheard_songs = [song for song in all_songs if song not in listened_songs]
-#
-#     recommendations = [(song, str(model.predict(selected_songs, song).est)) for song in unheard_songs]
-#
-#     recommendations = sorted(recommendations, key=lambda x: x[1], reverse=True)[:10]
-#
-#     return listened_songs, recommendations
-
-# Create an API endpoint to return a list of users
-# @app.route('/get_songs')
-# def get_songs():
-#     songs = song_df['title'].unique().tolist()
-#     return jsonify(songs)
-
-
-# @app.route('/get_songs')
-# def get_songs():
-#     songs = song_df[['song', 'title']].drop_duplicates()
-#     return jsonify({
-#         'songs': songs['song'].tolist(),
-#         'title': songs['title'].tolist()
-#     })
-#
-#
-# # Create an API endpoint to return the user's playlist and recommendations
-# @app.route('/get_user_and_recommendations', methods=['POST'])
-# def get_user_and_recommendations():
-#     user_id = request.json['user_id']
-#     user_songs, recommendations = collaborative_filtering_recommendation(user_id, collab_model, song_df)
-#
-#     return jsonify({
-#         'user_songs': user_songs,
-#         'recommendations': recommendations
-#     })
-
-
-# Create an API endpoint to return recommendations
-# @app.route('/get_recommendations', methods=['POST'])
-# def get_recommendations():
-#     song = request.json['song']
-#     user_songs, recommendations = collaborative_filtering_recommendation(song, collab_model, song_df)
-#
-#     return jsonify({
-#         'user_songs': user_songs,
-#         'recommendations': recommendations
-#     })
-
-
-# @app.route('/get_recommendations_by_song', methods=['POST'])
-# def get_recommendations_by_song():
-#     data = request.get_json()
-#     # selected_songs = data.get('selectedSongs', [])
-#     # song = song_df['title'].unique()
-#     selected_songs = data.get('selectedSongs', [])
-#
-#     listened_songs, recommendations = collaborative_filtering_recommendation(selected_songs, collab_model, song_df)
-#     print(data)
-#     return jsonify({
-#         'listenedSongs': listened_songs,
-#         'recommendations': recommendations
-#     })
 
 
 @app.route('/')
@@ -124,67 +30,113 @@ def index():
     return render_template('index.html', songs=song_df['title'])
 
 
+@app.route('/get_songs')
+def get_songs():
+    songs = song_df[['song', 'title', 'artist_name', 'release']].drop_duplicates()
+    return jsonify({
+        'songs': songs.to_dict(orient='records')
+    })
+
+
 @app.route('/recommend', methods=['POST'])
 def get_recommendations():
     # Get selected songs from the request
-    # selected_songs = request.form.getlist('selected_songs')
-    data = request.get_json()
-    selected_songs = data.get('selected_songs', [])
-    # Collaborative Filtering Recommendations
-    collab_recommendations = collaborative_filtering_recommendation(temp_user_id, collab_model, song_df, selected_songs)
+    song_ids = request.get_json().get('selected_songs', [])
 
-    # Content-Based Recommendations
-    content_recommendations = content_based_recommendation(selected_songs, song_df, tfidf_vectorizer, content_model)
+    # check number of songs that user selected, if number_song < threshold => return top 10 most populer song
+    num_song = len(song_ids)
+    if num_song < 5:
+        top_10_songs = get_top_song()
+        top_songs_info = song_df[song_df["song"].isin(top_10_songs.index)][['title', 'artist_name']].drop_duplicates()
+        top_songs_info["Score"] = "Top_10_Most_Popular_Song"
+        return make_response(jsonify({
+            "recommendations": top_songs_info.to_dict(orient='records')
+        }))
 
-    # Combine recommendations (you can customize the merging strategy)
-    combined_recommendations = combine_recommendations(collab_recommendations, content_recommendations)
+    # Get hybrid recommendations
+    hybrid_recommendations = get_hybrid_recommendations(song_ids)
+    df_hybrid = pd.DataFrame(hybrid_recommendations, columns=["song", "Score"])
+    # Merge/join the two DataFrames on the 'song_id' column
+    result_df = pd.merge(df_hybrid, song_df, on='song')[['title', 'artist_name', "Score"]].drop_duplicates()
 
-    return render_template("index.html",  recommendations=combined_recommendations)
-
-
-def collaborative_filtering_recommendation(user_id, model, df, listened_songs):
-    # Add selected songs to the dataset for the temporary user
-    temp_user_df = pd.DataFrame({'user': [temp_user_id] * len(listened_songs), 'title': listened_songs,
-                                 'play_count': [1] * len(listened_songs)})
-    song_df1 = pd.concat([song_df, temp_user_df])
-
-    # get unique songs
-    all_songs = song_df1['title'].unique()
-    unheard_songs = [song for song in all_songs if song not in listened_songs]
-
-    recommendations = [(song, model.predict(user_id, song).est) for song in unheard_songs]
-    recommendations = sorted(recommendations, key=lambda x: x[1], reverse=True)[:10]
-
-    return recommendations
+    return make_response(jsonify({
+        "recommendations": result_df.to_dict(orient='records')
+    }))
 
 
-def content_based_recommendation(selected_songs, df, tfidf_vectorizer, similarity_matrix):
-    # Combine selected songs into a single string for TF-IDF vectorization
-    selected_songs_str = ' '.join(selected_songs)
+# Function to get collaborative filtering recommendations
+def get_collab_recommendations(songs_listened):
+    all_songs = song_df['song'].unique()
+    songs_user_has_listened = set(songs_listened)
+    songs_to_recommend = list(set(all_songs) - songs_user_has_listened)
 
-    # Transform the selected songs using the pre-trained TF-IDF vectorizer
-    selected_songs_tfidf = tfidf_vectorizer.transform([selected_songs_str])
+    recommendations = [(item, collab_model.predict(temp_user_id, item).est) for item in songs_to_recommend]
+    top_recommendations = sorted(recommendations, key=lambda x: x[1], reverse=True)[:10]
 
-    # Calculate cosine similarities between the selected_songs_tfidf and similarity_matrix
-    cosine_similarities = linear_kernel(selected_songs_tfidf, tfidf_matrix)
-
-    # Get indices of top-N recommendations based on cosine similarities
-    top_n_recommendations_indices = cosine_similarities.argsort()[:-11:-1]
-
-    return top_n_recommendations_indices
+    return [(recommendation[0], recommendation[1]) for recommendation in top_recommendations]
 
 
-def combine_recommendations(collab_recommendations, content_recommendations):
-    # Combine recommendations using a simple strategy (e.g., averaging scores)
-    combined_recommendations = []
-    for collab_rec, content_rec in zip(collab_recommendations, content_recommendations):
-        combined_score = (collab_rec[1] + content_rec[1]) / 2
-        combined_recommendations.append((collab_rec[0], combined_score))
+# Function to get content-based filtering recommendations
+def get_content_recommendations(songs_listened, df):
+    songs_listened = pd.DataFrame(songs_listened, columns=["song"])
+    # Merge songs_listened với song_df để lấy ra data các bài hát mà người dùng đã nghe
+    user_listened_data = pd.merge(songs_listened, song_df, on='song', how='inner')[['title', "artist_name", 'release']]
 
-    # Sort combined recommendations by score
-    combined_recommendations = sorted(combined_recommendations, key=lambda x: x[1], reverse=True)[:10]
+    # Fit the TF-IDF vectorizer on the titles of the songs the user has listened to
+    tfidf_vectorizer.fit(user_listened_data[['title', "artist_name", 'release']])
 
-    return combined_recommendations
+    # Transform the titles of all songs to TF-IDF vectors
+    tfidf_matrix_user = tfidf_vectorizer.transform(user_listened_data[['title', "artist_name", 'release']])
+    tfidf_matrix_all = tfidf_vectorizer.transform(df[['title', "artist_name", 'release']])
+
+    # Compute similarity scores using cosine similarity
+    content_scores = linear_kernel(tfidf_matrix_user, tfidf_matrix_all).mean(axis=0)
+
+    content_predictions = list(enumerate(content_scores))
+
+    # Sort content-based predictions by score in descending order
+    sorted_indices = sorted(content_predictions, key=lambda x: x[1], reverse=True)
+
+    # Get the top recommended songs
+    top_recommendations = [list(df['song'])[idx] for idx, _ in sorted_indices[:10]]
+    return [(song, content_scores[df[df['song'] == song].index[0]]) for song in top_recommendations]
+
+
+# Function to get hybrid recommendations
+def get_hybrid_recommendations(songs_listened, top_n=10):
+    # Collaborative filtering predictions
+    collab_predictions = get_collab_recommendations(songs_listened)
+
+    # Content-based filtering predictions
+    content_recommendations = get_content_recommendations(songs_listened, song_df)
+
+    # Combine predictions from both models (simple average here)
+    hybrid_predictions = collab_predictions + content_recommendations
+
+    # Filter out songs the user has already listened to
+    songs_user_has_listened = set(songs_listened)
+    hybrid_predictions = [(song, score) for song, score in hybrid_predictions if song not in songs_user_has_listened]
+
+    # Get the top recommended songs
+    top_recommendations = sorted(hybrid_predictions,
+                                 key=lambda x: (float('-inf') if isinstance(x[1], str) else float(x[1])),
+                                 reverse=True)[
+                          :top_n]
+
+    return top_recommendations
+
+
+def get_top_song():
+    # Calculate the total number of listens for each song
+    total_listen_count = song_df.groupby('song')['play_count'].sum()
+
+    # sorted by total number of listens in descending order
+    most_listened_songs = total_listen_count.sort_values(ascending=False)
+
+    # Displays the 10 most listened to songs
+    top_10_songs = pd.DataFrame(most_listened_songs.nlargest(10))
+
+    return top_10_songs
 
 
 if __name__ == '__main__':
